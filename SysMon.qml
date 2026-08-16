@@ -1,0 +1,485 @@
+import QtQuick
+import Quickshell
+import Quickshell.Io
+import qs.Commons
+import qs.Ui
+import "Model.js" as Model
+
+// Live CPU + RAM monitor for the bar.
+//
+// Sampling is a single `cat /proc/stat /proc/meminfo` per second — no second
+// process spawns on the hot path. CPU usage comes from jiffie deltas between
+// snapshots (the first sample only records a baseline), RAM is absolute and
+// reparsed every tick. The popup layers the detail: per-core bars, a
+// used/cache/swap breakdown, and the six hungriest processes. The process
+// list is sampled only while the popup is open, so the idle cost of the
+// widget stays one trivial cat per second.
+//
+// Colors follow the shell's state vocabulary: the label and the popup switch
+// from `foreground` to `urgent` once CPU or memory crosses its alert
+// threshold (defaults: 85% cpu, 90% mem). The label is pure text — nerd
+// icons lose all shape at caption size in the bar font, so the numbers carry
+// the meaning. Vertical bars show the CPU percent only; details live in the
+// tooltip.
+Panel {
+  id: root
+  moduleName: "eipi10.cpu-ram"
+  // No IPC surface: one bar instance exists per monitor anyway and there is
+  // nothing to summon remotely, so skip the IpcHandler entirely.
+  manageIpc: false
+
+  // ------------------------------------------------------------- settings
+  readonly property bool showCpu: setting("showCpu", true) === true
+  readonly property bool showRam: setting("showRam", true) === true
+  readonly property int cpuAlert: clampAlert(setting("cpuAlert", 85))
+  readonly property int memAlert: clampAlert(setting("memAlert", 90))
+
+  function clampAlert(v) {
+    var n = Number(v)
+    if (!isFinite(n) || n <= 0) return 85
+    return Math.max(5, Math.min(100, Math.round(n)))
+  }
+
+  // ------------------------------------------------------------- live data
+  property var prevStat: null
+  property real cpuPercent: 0
+  property var coreSamples: [] // [{ p: pct }, ...] — replaced wholesale each tick
+  property var mem: ({ total: 0, used: 0, cache: 0, swapTotal: 0, swapUsed: 0 })
+  property var topProcs: []
+
+  readonly property int coreCount: coreSamples.length
+  readonly property real ramPercent: Model.percentOf(mem.used, mem.total)
+  readonly property bool swapActive: mem.swapUsed > 0
+  readonly property bool hot: cpuPercent >= cpuAlert || ramPercent >= memAlert
+
+  // ------------------------------------------------------------- palette
+  readonly property color foreground: root.barForeground
+  readonly property color urgent: bar ? bar.urgent : Color.urgent
+  readonly property color dim: Qt.darker(foreground, 1.55)
+  readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
+
+  // ------------------------------------------------------------- sampling
+  function consumeSample(raw) {
+    var split = Model.splitProcOutput(raw)
+    var stat = Model.parseStat(split.stat)
+    if (stat.total) {
+      var prev = root.prevStat
+      root.cpuPercent = Model.cpuPercent(prev && prev.total, stat.total)
+      var perCore = []
+      for (var i = 0; i < stat.cores.length; i++) {
+        perCore.push({ p: Model.cpuPercent(prev && prev.cores[i], stat.cores[i]) })
+      }
+      root.coreSamples = perCore
+      root.prevStat = stat
+    }
+    var m = Model.parseMeminfo(split.meminfo)
+    if (m.total > 0) root.mem = m
+  }
+
+  Timer {
+    id: sampleTimer
+    interval: 1000
+    running: true
+    repeat: true
+    triggeredOnStart: true
+    onTriggered: {
+      if (!readProc.running) readProc.running = true
+    }
+  }
+
+  Process {
+    id: readProc
+    command: ["cat", "/proc/stat", "/proc/meminfo"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.consumeSample(text)
+    }
+  }
+
+  // Top processes: sampled only while the popup is open.
+  Timer {
+    id: topTimer
+    interval: 2000
+    running: root.opened
+    repeat: true
+    triggeredOnStart: true
+    onTriggered: {
+      if (!topProc.running) topProc.running = true
+    }
+  }
+
+  Process {
+    id: topProc
+    command: ["bash", "-c", "ps -eo comm=,%cpu=,%mem= --sort=-%cpu | head -6"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.topProcs = Model.parseTop(text)
+    }
+  }
+
+  // ------------------------------------------------------------- labels
+  readonly property string cpuLabel: "CPU " + Math.round(cpuPercent) + "%"
+  readonly property string ramLabel: "RAM " + Math.round(ramPercent) + "% " + Model.compactBytes(mem.used) + "/" + Model.compactBytes(mem.total)
+
+  // Vertical bars are too narrow for the full line; CPU percent only.
+  readonly property string labelText: {
+    if (root.vertical) return Math.round(cpuPercent) + "%"
+    var parts = []
+    if (showCpu) parts.push(cpuLabel)
+    if (showRam) parts.push(ramLabel)
+    return parts.join(" \u00b7 ")
+  }
+
+  readonly property string tooltipText: {
+    var parts = []
+    if (showCpu) parts.push("CPU " + Math.round(cpuPercent) + "% \u00b7 " + coreCount + " cores")
+    if (showRam) parts.push("RAM " + Model.compactBytes(mem.used) + "/" + Model.compactBytes(mem.total) + " (" + Math.round(ramPercent) + "%)")
+    if (swapActive) parts.push("swap " + Model.compactBytes(mem.swapUsed) + "/" + Model.compactBytes(mem.swapTotal))
+    return parts.join(" \u00b7 ")
+  }
+
+  visible: showCpu || showRam
+  implicitWidth: button.implicitWidth
+  implicitHeight: button.implicitHeight
+
+  WidgetButton {
+    id: button
+    anchors.fill: parent
+    bar: root.bar
+    text: root.labelText
+    fontSize: Style.font.caption
+    horizontalMargin: 6
+    active: root.hot
+    tooltipText: root.tooltipText
+    onPressed: function(b) {
+      if (b === Qt.LeftButton) root.toggle()
+    }
+  }
+
+  KeyboardPanel {
+    id: panel
+    anchorItem: button
+    owner: root
+    bar: root.bar
+    open: root.opened
+    focusTarget: keyCatcher
+    contentWidth: panel.fittedContentWidth(Style.space(400))
+    contentHeight: panel.fittedContentHeight(column.implicitHeight)
+
+    PanelKeyCatcher {
+      id: keyCatcher
+      anchors.fill: parent
+      onCloseRequested: root.close()
+      onTabRequested: function(direction) { root.switchPanel(direction) }
+
+      Column {
+        id: column
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.top: parent.top
+        spacing: Style.space(14)
+
+        // ---------- hero: CPU | RAM ----------
+        Row {
+          width: parent.width
+          spacing: Style.space(16)
+
+          HeroCell {
+            title: "CPU"
+            subtitle: root.coreCount + " cores"
+            percent: Math.round(root.cpuPercent)
+            tint: root.cpuPercent >= root.cpuAlert ? root.urgent : root.foreground
+          }
+
+          HeroCell {
+            title: "RAM"
+            subtitle: Model.compactBytes(root.mem.used) + " / " + Model.compactBytes(root.mem.total)
+            percent: Math.round(root.ramPercent)
+            tint: root.ramPercent >= root.memAlert ? root.urgent : root.foreground
+          }
+        }
+
+        // ---------- per-core CPU ----------
+        PanelSeparator { foreground: root.foreground }
+
+        PanelSectionHeader {
+          text: "CPU CORES"
+          foreground: root.foreground
+          fontFamily: root.fontFamily
+        }
+
+        Row {
+          // 16 cores × 12px + 15 gaps × 4px ≈ 252px, centered in the panel
+          anchors.horizontalCenter: parent.horizontalCenter
+          spacing: Style.space(4)
+
+          Repeater {
+            model: root.coreSamples
+            delegate: CoreBar { pct: modelData.p }
+          }
+        }
+
+        // ---------- memory breakdown ----------
+        PanelSeparator { foreground: root.foreground }
+
+        PanelSectionHeader {
+          text: "MEMORY"
+          foreground: root.foreground
+          fontFamily: root.fontFamily
+        }
+
+        MemRow {
+          label: "Used"
+          used: root.mem.used
+          total: root.mem.total
+        }
+
+        MemRow {
+          label: "Cache"
+          used: root.mem.cache
+          total: root.mem.total
+          // Cache is reclaimable headroom, not pressure: no percent, no alert tint.
+          pressure: false
+        }
+
+        MemRow {
+          label: "Swap"
+          used: root.mem.swapUsed
+          total: root.mem.swapTotal
+          visible: root.swapActive
+        }
+
+        // ---------- top processes ----------
+        PanelSeparator { foreground: root.foreground }
+
+        PanelSectionHeader {
+          text: "TOP PROCESSES"
+          foreground: root.foreground
+          fontFamily: root.fontFamily
+        }
+
+        Row {
+          width: parent.width
+          spacing: Style.space(6)
+
+          Text {
+            text: "PROCESS"
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.bodySmall
+            font.bold: true
+            // 84 = cpu col (36) + gap (6) + mem col (36) + leading gap (6)
+            width: parent.width - Style.space(84)
+          }
+          Text {
+            text: "CPU"
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.bodySmall
+            font.bold: true
+            width: Style.space(36)
+            horizontalAlignment: Text.AlignRight
+          }
+          Text {
+            text: "MEM"
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.bodySmall
+            font.bold: true
+            width: Style.space(36)
+            horizontalAlignment: Text.AlignRight
+          }
+        }
+
+        Column {
+          width: parent.width
+          spacing: Style.space(5)
+
+          Repeater {
+            model: root.topProcs
+            delegate: TopRow { proc: modelData }
+          }
+
+          Text {
+            visible: root.topProcs.length === 0
+            text: "sampling\u2026"
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+          }
+        }
+      }
+    }
+  }
+
+  // ------------------------------------------------------------- components
+  component HeroCell: Item {
+    property string title: ""
+    property string subtitle: ""
+    property int percent: 0
+    property color tint: root.foreground
+
+    width: (parent.width - parent.spacing) / 2
+    implicitHeight: Math.max(labels.implicitHeight, pctLabel.implicitHeight)
+
+    Column {
+      id: labels
+      anchors.left: parent.left
+      anchors.right: pctLabel.left
+      anchors.rightMargin: Style.space(10)
+      anchors.verticalCenter: parent.verticalCenter
+      spacing: Style.space(1)
+
+      Text {
+        text: title
+        color: root.foreground
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.title
+        font.bold: true
+        width: parent.width
+      }
+
+      Text {
+        text: subtitle
+        color: root.dim
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+        elide: Text.ElideRight
+        width: parent.width
+      }
+    }
+
+    Text {
+      id: pctLabel
+      text: percent + "%"
+      color: tint
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.displayLarge
+      font.bold: true
+      anchors.right: parent.right
+      anchors.verticalCenter: parent.verticalCenter
+    }
+  }
+
+  component CoreBar: Rectangle {
+    property real pct: 0
+
+    readonly property bool hot: pct >= root.cpuAlert
+
+    width: Style.space(12)
+    height: Style.space(28)
+    radius: Style.space(2)
+    color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.14)
+
+    Rectangle {
+      anchors.bottom: parent.bottom
+      width: parent.width
+      height: Math.max(1, pct / 100 * parent.height)
+      radius: parent.radius
+      color: hot ? root.urgent : root.foreground
+
+      Behavior on height {
+        NumberAnimation { duration: 120; easing.type: Easing.OutCubic }
+      }
+    }
+  }
+
+  component MemRow: Item {
+    property string label: ""
+    property real used: 0
+    property real total: 0
+    property bool pressure: true
+
+    readonly property real pct: total > 0 ? Math.min(100, used / total * 100) : 0
+
+    width: parent.width
+    implicitHeight: Style.space(26)
+
+    Text {
+      id: labelText
+      text: label
+      color: root.dim
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.bodySmall
+      anchors.left: parent.left
+      anchors.verticalCenter: parent.verticalCenter
+      width: Style.space(60)
+    }
+
+    Item {
+      id: track
+      anchors.left: labelText.right
+      anchors.leftMargin: Style.space(8)
+      anchors.right: valueText.left
+      anchors.rightMargin: Style.space(12)
+      anchors.verticalCenter: parent.verticalCenter
+      height: Style.space(3)
+
+      Rectangle {
+        anchors.fill: parent
+        color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.12)
+        radius: height / 2
+      }
+
+      Rectangle {
+        width: Math.max(1, parent.width * (pct / 100))
+        height: parent.height
+        radius: height / 2
+        color: pressure && pct >= root.memAlert ? root.urgent : root.foreground
+
+        Behavior on width {
+          NumberAnimation { duration: 120; easing.type: Easing.OutCubic }
+        }
+      }
+    }
+
+    Text {
+      id: valueText
+      text: {
+        var right = Model.compactBytes(used)
+        if (pressure && total > 0) right += " \u00b7 " + Math.round(pct) + "%"
+        return right
+      }
+      color: root.foreground
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.bodySmall
+      anchors.right: parent.right
+      anchors.verticalCenter: parent.verticalCenter
+    }
+  }
+
+  component TopRow: Row {
+    property var proc: null
+
+    width: parent.width
+    spacing: Style.space(6)
+
+    Text {
+      text: proc ? proc.name : ""
+      color: root.foreground
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.bodySmall
+      elide: Text.ElideRight
+      // Same right-column budget as the header row.
+      width: parent.width - Style.space(84)
+    }
+
+    Text {
+      text: proc ? proc.cpu.toFixed(1) : ""
+      color: proc && proc.cpu >= root.cpuAlert ? root.urgent : root.foreground
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.bodySmall
+      width: Style.space(36)
+      horizontalAlignment: Text.AlignRight
+    }
+
+    Text {
+      text: proc ? proc.mem.toFixed(1) : ""
+      color: proc && proc.mem >= root.memAlert / 10 ? root.urgent : root.foreground
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.bodySmall
+      width: Style.space(36)
+      horizontalAlignment: Text.AlignRight
+    }
+  }
+}
