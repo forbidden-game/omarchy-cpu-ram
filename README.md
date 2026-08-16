@@ -58,11 +58,15 @@ other bar widget:
 omarchy plugin list                    # see discovered plugins
 omarchy plugin enable eipi10.cpu-ram   # enable after install
 omarchy plugin disable eipi10.cpu-ram  # remove from the bar
+omarchy plugin remove eipi10.cpu-ram --yes   # uninstall completely
 omarchy plugin update                  # update all git-managed plugins
 
 omarchy bar move eipi10.cpu-ram --section right   # move between sections
 omarchy bar move eipi10.cpu-ram --section left    # or center
 ```
+
+Removal is clean: the plugin only reads `/proc` and `/sys`, writes nothing
+outside its own directory, and needs no sudo rules.
 
 The bar hot-reloads `~/.config/omarchy/shell.json` on save, so settings can
 be tuned inline:
@@ -124,3 +128,7 @@ code. When iterating on the plugin, the reliable loop is:
 rm -rf ~/.cache/quickshell/qmlcache
 omarchy restart shell
 ```
+
+## License
+
+MIT — see [LICENSE](LICENSE).
