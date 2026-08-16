@@ -100,6 +100,27 @@ function percentOf(used, total) {
   return Math.max(0, Math.min(100, used / total * 100))
 }
 
+// Extract the trailing CPU temperature (millidegrees) from the concatenated
+// output of `cat /proc/stat /proc/meminfo <tempfile>`. Scans backwards: the
+// first digits-only line is the temp; a meminfo "... kB" line means there is
+// none. /proc/stat lines always start with "cpu", so they never match.
+function parseTemp(raw) {
+  var lines = String(raw || "").split("\n")
+  for (var i = lines.length - 1; i >= 0; i--) {
+    var line = lines[i].trim()
+    if (/^\d+$/.test(line)) return Number(line)
+    if (/^\w+:\s+\d+\s*kB/.test(line)) return 0
+  }
+  return 0
+}
+
+// Millidegrees Celsius -> rounded whole degrees; 0 stays 0 ("unknown").
+function celsius(milli) {
+  var n = Number(milli)
+  if (!isFinite(n) || n <= 0) return 0
+  return Math.round(n / 1000)
+}
+
 // Compact byte string with one decimal place above 1K: 812B, 1.2K, 34M, 6.5G.
 function compactBytes(bytes) {
   var n = Number(bytes)

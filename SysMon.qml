@@ -31,13 +31,21 @@ Panel {
   // ------------------------------------------------------------- settings
   readonly property bool showCpu: setting("showCpu", true) === true
   readonly property bool showRam: setting("showRam", true) === true
+  readonly property bool showTemp: setting("showTemp", true) === true
   readonly property int cpuAlert: clampAlert(setting("cpuAlert", 85))
   readonly property int memAlert: clampAlert(setting("memAlert", 90))
+  readonly property int tempAlert: clampTempAlert(setting("tempAlert", 85))
 
   function clampAlert(v) {
     var n = Number(v)
     if (!isFinite(n) || n <= 0) return 85
     return Math.max(5, Math.min(100, Math.round(n)))
+  }
+
+  function clampTempAlert(v) {
+    var n = Number(v)
+    if (!isFinite(n) || n <= 0) return 85
+    return Math.max(30, Math.min(110, Math.round(n)))
   }
 
   // ------------------------------------------------------------- live data
@@ -46,11 +54,15 @@ Panel {
   property var coreSamples: [] // [{ p: pct }, ...] — replaced wholesale each tick
   property var mem: ({ total: 0, used: 0, cache: 0, swapTotal: 0, swapUsed: 0 })
   property var topProcs: []
+  property string tempPath: "" // thermal zone temp file, discovered by probe
+  property real tempMilli: 0 // millidegrees; 0 = no sensor
 
   readonly property int coreCount: coreSamples.length
   readonly property real ramPercent: Model.percentOf(mem.used, mem.total)
   readonly property bool swapActive: mem.swapUsed > 0
-  readonly property bool hot: cpuPercent >= cpuAlert || ramPercent >= memAlert
+  readonly property real tempC: Model.celsius(tempMilli)
+  readonly property bool tempKnown: tempC > 0
+  readonly property bool hot: cpuPercent >= cpuAlert || ramPercent >= memAlert || (tempKnown && tempC >= tempAlert)
 
   // ------------------------------------------------------------- palette
   readonly property color foreground: root.barForeground
@@ -74,6 +86,42 @@ Panel {
     }
     var m = Model.parseMeminfo(split.meminfo)
     if (m.total > 0) root.mem = m
+    root.tempMilli = Model.parseTemp(raw)
+  }
+
+  // CPU temp source discovery. Thermal zone numbers are dynamic across
+  // boots, so locate x86_pkg_temp (fallback: coretemp package) on a slow
+  // probe and only cat the single file on the hot path.
+  Timer {
+    id: tempProbeTimer
+    interval: 30000
+    running: true
+    repeat: true
+    triggeredOnStart: true
+    onTriggered: {
+      if (!tempProbeProc.running) tempProbeProc.running = true
+    }
+  }
+
+  Process {
+    id: tempProbeProc
+    command: [
+      "bash", "-c",
+      "for z in /sys/class/thermal/thermal_zone*; do " +
+      "[ \"$(cat \"$z/type\" 2>/dev/null)\" = \"x86_pkg_temp\" ] && { echo \"$z/temp\"; exit 0; }; " +
+      "done; " +
+      "for h in /sys/class/hwmon/hwmon*; do " +
+      "[ \"$(cat \"$h/name\" 2>/dev/null)\" = \"coretemp\" ] && { echo \"$h/temp1_input\"; exit 0; }; " +
+      "done"
+    ]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var p = String(text || "").trim()
+        root.tempPath = p
+        if (p === "") root.tempMilli = 0
+      }
+    }
   }
 
   Timer {
@@ -83,13 +131,16 @@ Panel {
     repeat: true
     triggeredOnStart: true
     onTriggered: {
-      if (!readProc.running) readProc.running = true
+      if (readProc.running) return
+      var cmd = ["cat", "/proc/stat", "/proc/meminfo"]
+      if (root.tempPath !== "") cmd.push(root.tempPath)
+      readProc.command = cmd
+      readProc.running = true
     }
   }
 
   Process {
     id: readProc
-    command: ["cat", "/proc/stat", "/proc/meminfo"]
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: root.consumeSample(text)
@@ -119,6 +170,7 @@ Panel {
 
   // ------------------------------------------------------------- labels
   readonly property string cpuLabel: "CPU " + Math.round(cpuPercent) + "%"
+  readonly property string tempLabel: tempC + "\u00b0C"
   readonly property string ramLabel: "RAM " + Math.round(ramPercent) + "% " + Model.compactBytes(mem.used) + "/" + Model.compactBytes(mem.total)
 
   // Vertical bars are too narrow for the full line; CPU percent only.
@@ -126,6 +178,7 @@ Panel {
     if (root.vertical) return Math.round(cpuPercent) + "%"
     var parts = []
     if (showCpu) parts.push(cpuLabel)
+    if (showTemp && tempKnown) parts.push(tempLabel)
     if (showRam) parts.push(ramLabel)
     return parts.join(" \u00b7 ")
   }
@@ -133,6 +186,7 @@ Panel {
   readonly property string tooltipText: {
     var parts = []
     if (showCpu) parts.push("CPU " + Math.round(cpuPercent) + "% \u00b7 " + coreCount + " cores")
+    if (showTemp && tempKnown) parts.push(tempC + "\u00b0C")
     if (showRam) parts.push("RAM " + Model.compactBytes(mem.used) + "/" + Model.compactBytes(mem.total) + " (" + Math.round(ramPercent) + "%)")
     if (swapActive) parts.push("swap " + Model.compactBytes(mem.swapUsed) + "/" + Model.compactBytes(mem.swapTotal))
     return parts.join(" \u00b7 ")
@@ -186,9 +240,10 @@ Panel {
 
           HeroCell {
             title: "CPU"
-            subtitle: root.coreCount + " cores"
+            subtitle: root.coreCount + " cores" + (root.tempKnown ? " \u00b7 " + root.tempC + "\u00b0C" : "")
             percent: Math.round(root.cpuPercent)
-            tint: root.cpuPercent >= root.cpuAlert ? root.urgent : root.foreground
+            tint: (root.cpuPercent >= root.cpuAlert || (root.tempKnown && root.tempC >= root.tempAlert))
+              ? root.urgent : root.foreground
           }
 
           HeroCell {
