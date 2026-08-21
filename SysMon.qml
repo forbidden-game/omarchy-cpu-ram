@@ -7,10 +7,11 @@ import "Model.js" as Model
 
 // Live CPU + RAM monitor for the bar.
 //
-// Sampling is a single `cat /proc/stat /proc/meminfo` per second — no second
-// process spawns on the hot path. CPU usage comes from jiffie deltas between
-// snapshots (the first sample only records a baseline), RAM is absolute and
-// reparsed every tick. The popup layers the detail: per-core bars, a
+// Sampling is a single `cat /proc/stat /proc/meminfo /proc/loadavg` per
+// second — no second process spawns on the hot path. CPU usage comes from
+// jiffie deltas between snapshots (the first sample only records a
+// baseline), RAM is absolute and reparsed every tick. The popup layers the
+// detail: a justified per-core grid with an avg/max/load footer, a
 // used/cache/swap breakdown, and the six hungriest processes. The process
 // list is sampled only while the popup is open, so the idle cost of the
 // widget stays one trivial cat per second.
@@ -52,12 +53,26 @@ Panel {
   property var prevStat: null
   property real cpuPercent: 0
   property var coreSamples: [] // [{ p: pct }, ...] — replaced wholesale each tick
+  property var loadavg: [0, 0, 0] // [1min, 5min, 15min] from /proc/loadavg
   property var mem: ({ total: 0, used: 0, cache: 0, swapTotal: 0, swapUsed: 0 })
   property var topProcs: []
   property string tempPath: "" // thermal zone temp file, discovered by probe
   property real tempMilli: 0 // millidegrees; 0 = no sensor
 
   readonly property int coreCount: coreSamples.length
+
+  // Footer stats for the per-core grid: mean and peak across cores.
+  readonly property real coreAvg: {
+    var sum = 0
+    for (var i = 0; i < coreCount; i++) sum += coreSamples[i].p
+    return coreCount > 0 ? sum / coreCount : 0
+  }
+  readonly property real coreMax: {
+    var m = 0
+    for (var i = 0; i < coreCount; i++) if (coreSamples[i].p > m) m = coreSamples[i].p
+    return m
+  }
+
   readonly property real ramPercent: Model.percentOf(mem.used, mem.total)
   readonly property bool swapActive: mem.swapUsed > 0
   readonly property real tempC: Model.celsius(tempMilli)
@@ -87,6 +102,7 @@ Panel {
     var m = Model.parseMeminfo(split.meminfo)
     if (m.total > 0) root.mem = m
     root.tempMilli = Model.parseTemp(raw)
+    root.loadavg = Model.parseLoadavg(raw)
   }
 
   // CPU temp source discovery. Thermal zone numbers are dynamic across
@@ -132,7 +148,7 @@ Panel {
     triggeredOnStart: true
     onTriggered: {
       if (readProc.running) return
-      var cmd = ["cat", "/proc/stat", "/proc/meminfo"]
+      var cmd = ["cat", "/proc/stat", "/proc/meminfo", "/proc/loadavg"]
       if (root.tempPath !== "") cmd.push(root.tempPath)
       readProc.command = cmd
       readProc.running = true
@@ -240,7 +256,11 @@ Panel {
 
           HeroCell {
             title: "CPU"
-            subtitle: root.coreCount + " cores" + (root.tempKnown ? " \u00b7 " + root.tempC + "\u00b0C" : "")
+            subtitle: root.coreCount + " cores"
+            // Temp rides as its own trailing run so it can speak up (urgent)
+            // without dragging the core count along.
+            detail: root.tempKnown ? " \u00b7 " + root.tempC + "\u00b0C" : ""
+            detailAlert: root.tempKnown && root.tempC >= root.tempAlert
             percent: Math.round(root.cpuPercent)
             tint: (root.cpuPercent >= root.cpuAlert || (root.tempKnown && root.tempC >= root.tempAlert))
               ? root.urgent : root.foreground
@@ -263,14 +283,62 @@ Panel {
           fontFamily: root.fontFamily
         }
 
-        Row {
-          // 16 cores × 12px + 15 gaps × 4px ≈ 252px, centered in the panel
-          anchors.horizontalCenter: parent.horizontalCenter
-          spacing: Style.space(4)
+        Column {
+          width: parent.width
+          spacing: Style.space(5)
 
-          Repeater {
-            model: root.coreSamples
-            delegate: CoreBar { pct: modelData.p }
+          Column {
+            width: parent.width
+            spacing: Style.space(3)
+
+            // Justified per-core grid: bars run edge-to-edge like every
+            // other section. One row up to 16 cores; wider CPUs wrap every
+            // 16. Fewer cores still spread full-width because columns
+            // follows the count.
+            Grid {
+              id: coreGrid
+              width: parent.width
+              readonly property int cols: Math.max(1, Math.min(16, root.coreCount))
+              columns: cols
+              columnSpacing: Style.space(4)
+              rowSpacing: Style.space(6)
+              readonly property int barWidth: Math.floor((width - columnSpacing * (cols - 1)) / cols)
+
+              Repeater {
+                model: root.coreSamples
+                delegate: CoreBar {
+                  pct: modelData.p
+                  width: coreGrid.barWidth
+                }
+              }
+            }
+
+            // Hairline the fills rise from — grounds the row edge-to-edge.
+            PanelSeparator {
+              foreground: root.foreground
+              strength: 0.18
+            }
+          }
+
+          // avg / max / load footer: labels dim, numbers foreground —
+          // hierarchy from typography, not chrome.
+          Row {
+            visible: root.coreCount > 0
+            spacing: Style.space(6)
+
+            StatLabel { text: "AVG" }
+            StatValue { text: Math.round(root.coreAvg) + "%" }
+            StatLabel { text: "\u00b7" }
+            StatLabel { text: "MAX" }
+            StatValue {
+              text: Math.round(root.coreMax) + "%"
+              color: root.coreMax >= root.cpuAlert ? root.urgent : root.foreground
+            }
+            StatLabel { text: "\u00b7" }
+            StatLabel { text: "LOAD" }
+            StatValue {
+              text: root.loadavg[0].toFixed(2) + " " + root.loadavg[1].toFixed(2) + " " + root.loadavg[2].toFixed(2)
+            }
           }
         }
 
@@ -371,11 +439,16 @@ Panel {
   component HeroCell: Item {
     property string title: ""
     property string subtitle: ""
+    // Trailing subtitle run (" · 50°C") with its own alert state, so a hot
+    // reading can turn urgent without recoloring the whole line.
+    property string detail: ""
+    property bool detailAlert: false
     property int percent: 0
     property color tint: root.foreground
 
     width: (parent.width - parent.spacing) / 2
-    implicitHeight: Math.max(labels.implicitHeight, pctLabel.implicitHeight)
+    // +8: capacity track (3px) plus breathing room under the labels.
+    implicitHeight: Math.max(labels.implicitHeight, pctLabel.implicitHeight) + Style.space(8)
 
     Column {
       id: labels
@@ -394,13 +467,27 @@ Panel {
         width: parent.width
       }
 
-      Text {
-        text: subtitle
-        color: root.dim
-        font.family: root.fontFamily
-        font.pixelSize: Style.font.caption
-        elide: Text.ElideRight
+      Row {
         width: parent.width
+        spacing: 0
+
+        Text {
+          text: subtitle
+          color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          elide: Text.ElideRight
+          width: parent.width - detailText.width
+        }
+
+        Text {
+          id: detailText
+          text: detail
+          visible: text !== ""
+          color: detailAlert ? root.urgent : root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+        }
       }
     }
 
@@ -414,12 +501,37 @@ Panel {
       anchors.right: parent.right
       anchors.verticalCenter: parent.verticalCenter
     }
+
+    // Capacity track anchors the big number and echoes the MemRow language:
+    // same 3px pill, alpha track, fill in the cell's state color.
+    Rectangle {
+      anchors.left: parent.left
+      anchors.right: parent.right
+      anchors.bottom: parent.bottom
+      height: Style.space(3)
+      radius: height / 2
+      color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.12)
+
+      Rectangle {
+        width: Math.max(1, parent.width * (percent / 100))
+        height: parent.height
+        radius: height / 2
+        color: tint
+
+        Behavior on width {
+          NumberAnimation { duration: 120; easing.type: Easing.OutCubic }
+        }
+      }
+    }
   }
 
   component CoreBar: Rectangle {
     property real pct: 0
 
     readonly property bool hot: pct >= root.cpuAlert
+    // Two-tier ink: quiet cores dim their stub so an idle machine reads as
+    // "calm", not "broken". Hot cores still get urgent.
+    readonly property bool active: pct >= 5
 
     width: Style.space(12)
     height: Style.space(28)
@@ -429,14 +541,34 @@ Panel {
     Rectangle {
       anchors.bottom: parent.bottom
       width: parent.width
-      height: Math.max(1, pct / 100 * parent.height)
+      height: Math.max(Style.space(2), pct / 100 * parent.height)
       radius: parent.radius
-      color: hot ? root.urgent : root.foreground
+      color: hot ? root.urgent
+        : active ? root.foreground
+        : Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.45)
 
       Behavior on height {
         NumberAnimation { duration: 120; easing.type: Easing.OutCubic }
       }
+      Behavior on color {
+        ColorAnimation { duration: 120 }
+      }
     }
+  }
+
+  // Footer stat typography for the CPU CORES section: dim bold labels,
+  // foreground numbers — hierarchy from type, not chrome.
+  component StatLabel: Text {
+    color: root.dim
+    font.family: root.fontFamily
+    font.pixelSize: Style.font.caption
+    font.bold: true
+  }
+
+  component StatValue: Text {
+    color: root.foreground
+    font.family: root.fontFamily
+    font.pixelSize: Style.font.caption
   }
 
   component MemRow: Item {

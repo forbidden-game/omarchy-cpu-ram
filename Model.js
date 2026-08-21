@@ -80,6 +80,16 @@ function parseMeminfo(raw) {
   }
 }
 
+// Parse /proc/loadavg into [one, five, fifteen] minute load averages.
+// Anchored at line start so only the loadavg line matches inside the
+// concatenated proc dump (stat lines start with "cpu", meminfo with words,
+// and a trailing temp file is digits-only).
+function parseLoadavg(raw) {
+  var m = String(raw || "").match(/^(\d+\.\d+)\s+(\d+\.\d+)\s+(\d+\.\d+)/m)
+  if (!m) return [0, 0, 0]
+  return [parseFloat(m[1]), parseFloat(m[2]), parseFloat(m[3])]
+}
+
 // Parse `ps -eo comm=,%cpu=,%mem= --sort=-%cpu | head -6` into top rows.
 // comm is matched lazily so names containing spaces parse correctly.
 function parseTop(raw) {

@@ -13,14 +13,16 @@ processes.
 - **State vocabulary** — the label and popup switch from `foreground` to
   `urgent` once CPU %, RAM %, or CPU temperature crosses its alert threshold.
 - **Popup panel** (left-click):
-  - CPU / RAM heroes with big percentages
-  - one progress bar per CPU core
+  - CPU / RAM heroes: big percentages over a slim capacity bar; the temp
+    reading turns urgent on its own once it crosses the threshold
+  - justified per-core grid (edge-to-edge, wraps every 16 cores) over a
+    hairline baseline, with an `AVG · MAX · LOAD` footer
   - memory breakdown: used / cache / swap
   - top 6 processes by CPU, refreshed while the panel is open
-- **Cheap sampling** — a single `cat /proc/stat /proc/meminfo` per second.
-  CPU usage comes from jiffie deltas, RAM is absolute. The process list is
-  sampled only while the popup is open, so the idle cost stays one trivial
-  process per second.
+- **Cheap sampling** — a single `cat /proc/stat /proc/meminfo /proc/loadavg`
+  per second. CPU usage comes from jiffie deltas, RAM and load averages are
+  absolute. The process list is sampled only while the popup is open, so the
+  idle cost stays one trivial process per second.
 - **CPU temperature** — the package temp (`x86_pkg_temp` thermal zone, with a
   `coretemp` fallback) is discovered by a slow 30s probe, because thermal
   zone numbers shift across boots. No root required.
